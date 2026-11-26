@@ -39,6 +39,12 @@ Re-run the same command after changing the code; it replaces the installed binar
   - *Done since yesterday*.
 - **2 My Tasks**: all open tasks, grouped by My Tasks section in Asana's order.
 - **3 Sessions**: open Rex sessions that belong to a task.
+- **4 Milestones**, **5 Decisions**, **6 Blockers**, **7 Questions**: open items across initiative projects, grouped by project, soonest due first. The right-hand column shows the assignee instead of the project.
+  - An initiative project is any open project that uses the `Attention type` custom field.
+  - Decisions, Blockers and Questions are tasks whose `Attention type` is `Decision`, `Blocker` or `Question`. Milestones are milestone tasks.
+  - The header shows how many decisions, blockers and questions are open.
+  - Each project's header shows its latest Asana status (on track, at risk, off track) and how many days old it is. The age turns amber after 7 days, since owners are asked to set a status weekly. `no status` means none has been set.
+  - Each Asana search returns at most 100 tasks, so very large initiatives may be cut short.
 
 Due dates are relative: `2d late` and `today` are coloured, then `tmrw`, a weekday within the next week, and the date after that. A `●` after a task means it has an open Rex session.
 
@@ -52,7 +58,7 @@ Tasks reload every 2 minutes and on `r`.
 |---|---|
 | `j` / `k`, ↓ / ↑ | Move |
 | `g` / `G` | First / last task |
-| `1` `2` `3`, `h` / `l`, Tab | Switch view (Tab switches focus while details are open) |
+| `1`–`7`, `h` / `l`, Tab | Switch view (Tab switches focus while details are open) |
 | `enter` | Focus the task's Rex session, or start one running Claude |
 | `space` / `p` | Toggle the details pane |
 | `J` / `K` | Scroll the details pane by 3 lines |

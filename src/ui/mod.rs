@@ -82,6 +82,45 @@ fn due_color(due: NaiveDate, done: bool) -> Color {
     }
 }
 
+/// The page on initiative projects asks owners to set a status every week.
+const STATUS_STALE_DAYS: i64 = 7;
+
+/// "● on track · 3d", amber when older than a week, "no status" when never set.
+fn project_status(app: &App, project: &str) -> Option<Line<'static>> {
+    let initiative = app
+        .initiatives
+        .iter()
+        .find(|i| crate::asana::display_name(&i.name) == project)?;
+    let Some(update) = &initiative.current_status_update else {
+        return Some(Line::from("no status".fg(WARN)));
+    };
+    let (label, color) = match update.status_type.as_str() {
+        "on_track" => ("on track", DONE),
+        "at_risk" => ("at risk", WARN),
+        "off_track" => ("off track", LATE),
+        "on_hold" => ("on hold", DIM),
+        "complete" => ("complete", DONE),
+        other => (other, DIM),
+    };
+    let age = (Local::now().date_naive() - update.created_at.with_timezone(&Local).date_naive())
+        .num_days();
+    let age_color = if age > STATUS_STALE_DAYS { WARN } else { DIM };
+    Some(Line::from(vec![
+        "● ".fg(color),
+        label.to_string().fg(color),
+        format!(" · {age}d").fg(age_color),
+    ]))
+}
+
+/// Initiative tabs group by project, so the column shows who owns the item instead.
+fn right_column<'a>(app: &App, task: &'a Task) -> &'a str {
+    if app.tab.is_initiative() {
+        task.assignee_name()
+    } else {
+        task.project()
+    }
+}
+
 fn has_session(app: &App, task: &Task) -> bool {
     rex::session_for(task, &app.sessions).is_some()
 }
@@ -168,7 +207,7 @@ fn hint_width(hints: &[(&str, &str)]) -> usize {
 const HELP: [(&str, &str); 15] = [
     ("j / k", "move"),
     ("g / G", "first / last"),
-    ("1 2 3, h / l", "switch view"),
+    ("1–7, h / l", "switch view"),
     ("enter", "focus or launch a Claude session"),
     ("space / p", "toggle details"),
     ("tab", "focus details (when open)"),
@@ -244,20 +283,33 @@ fn draw_screen(f: &mut Frame, app: &App) {
     draw_footer(f, app, footer);
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![" ◆ ".fg(ACCENT), "asana".bold().fg(TEXT), "     ".into()];
+/// Tab strip; `compact` shows inactive tabs by their number key so six tabs fit narrow panes.
+fn tab_spans(app: &App, compact: bool) -> Vec<Span<'static>> {
+    let sep = if compact { " · " } else { "  ·  " };
+    let mut spans = vec![" ◆ ".fg(ACCENT), "asana".bold().fg(TEXT), "   ".into()];
     for (i, &t) in Tab::ALL.iter().enumerate() {
         if i > 0 {
-            spans.push("  ·  ".fg(FAINT));
+            spans.push(sep.fg(FAINT));
         }
-        spans.push(if t == app.tab {
-            t.title().bold().fg(ACCENT)
-        } else {
-            t.title().fg(DIM)
+        spans.push(match (t == app.tab, compact) {
+            (true, _) => t.title().bold().fg(ACCENT),
+            (false, true) => (i + 1).to_string().fg(DIM),
+            (false, false) => t.title().fg(DIM),
         });
+        let n = app.initiative_count(t);
+        if matches!(t, Tab::Decisions | Tab::Blockers | Tab::Questions) && n > 0 {
+            let color = match t {
+                Tab::Blockers => LATE,
+                Tab::Decisions => WARN,
+                _ => ACCENT,
+            };
+            spans.push(format!(" {n}").fg(color));
+        }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans
+}
 
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mut right = vec![];
     if app.loading {
         right.push("⟳ syncing   ".fg(DIM));
@@ -266,7 +318,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         right.push("● ".fg(WARN));
         right.push(format!("{} sessions ", app.sessions.len()).fg(DIM));
     }
-    f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
+    let right = Line::from(right);
+    let full = Line::from(tab_spans(app, false));
+    let left = if full.width() + right.width() + 2 <= area.width as usize {
+        full
+    } else {
+        Line::from(tab_spans(app, true))
+    };
+    f.render_widget(Paragraph::new(left), area);
+    f.render_widget(Paragraph::new(right.right_aligned()), area);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -363,15 +423,26 @@ fn row_line<'a>(
     match row {
         Row::Blank => Line::from(""),
         Row::Header(title, n) => {
+            let status = if app.tab.is_initiative() {
+                project_status(app, title)
+            } else {
+                None
+            };
             let title = title.to_uppercase();
             let count = format!("  {n}  ");
-            let used = 1 + title.width() + count.width();
-            Line::from(vec![
+            let status_w = status.as_ref().map_or(0, |s| s.width() + 1);
+            let used = 1 + title.width() + count.width() + status_w;
+            let mut spans = vec![
                 " ".into(),
                 title.bold().fg(Color::Gray),
                 count.fg(DIM),
                 rule(width.saturating_sub(used)).fg(RULE),
-            ])
+            ];
+            if let Some(status) = status {
+                spans.push(" ".into());
+                spans.extend(status.spans);
+            }
+            Line::from(spans)
         }
         Row::Task(i) => {
             let t = &app.tasks[*i];
@@ -395,7 +466,7 @@ fn row_line<'a>(
                 " ".into(),
                 if done { name.fg(DIM) } else { name.fg(TEXT) },
                 " ".into(),
-                fit(t.project(), project_w).fg(DIM),
+                fit(right_column(app, t), project_w).fg(DIM),
                 session,
             ])
         }

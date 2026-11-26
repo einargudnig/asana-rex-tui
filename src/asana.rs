@@ -4,11 +4,17 @@ use serde_json::Value;
 use std::process::Command;
 use std::sync::OnceLock;
 
-const TASK_FIELDS: &str =
-    "name,completed,completed_at,due_on,assignee_section.name,projects.name,permalink_url";
+const TASK_FIELDS: &str = "name,completed,completed_at,due_on,assignee_section.name,projects.name,\
+permalink_url,resource_subtype,assignee.name,custom_fields.name,custom_fields.display_value";
+
+/// Initiative projects carry this enum field (Blocker, Decision, Risk, Question)
+/// on the tasks in their "Needs attention" section.
+const ATTENTION_FIELD: &str = "Attention type";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Named {
+    #[serde(default)]
+    pub gid: String,
     #[serde(default)]
     pub name: String,
 }
@@ -26,6 +32,17 @@ pub struct Task {
     pub projects: Vec<Named>,
     #[serde(default)]
     pub permalink_url: String,
+    #[serde(default)]
+    pub resource_subtype: String,
+    pub assignee: Option<Named>,
+    #[serde(default)]
+    pub custom_fields: Vec<CustomField>,
+    /// Assigned to me; only these show in Today and My Tasks.
+    #[serde(skip)]
+    pub mine: bool,
+    /// Name of the initiative project it lives in; only these show in the initiative tabs.
+    #[serde(skip)]
+    pub initiative: Option<String>,
 }
 
 impl Task {
@@ -35,6 +52,22 @@ impl Task {
             .map_or("No section", |s| s.name.as_str())
     }
 
+    pub fn is_milestone(&self) -> bool {
+        self.resource_subtype == "milestone"
+    }
+
+    pub fn attention(&self) -> Option<&str> {
+        self.custom_fields
+            .iter()
+            .find(|f| f.name == ATTENTION_FIELD)?
+            .display_value
+            .as_deref()
+    }
+
+    pub fn assignee_name(&self) -> &str {
+        self.assignee.as_ref().map_or("", |a| a.name.as_str())
+    }
+
     /// Cycle/sprint projects ("Cycle …", "Lota …") are noise next to the real home project.
     pub fn project(&self) -> &str {
         let is_cycle = |p: &&Named| p.name.contains("Cycle ") || p.name.contains("Lota ");
@@ -42,10 +75,13 @@ impl Task {
             .iter()
             .find(|p| !is_cycle(p))
             .or(self.projects.first())
-            .map_or("", |p| {
-                p.name.trim_start_matches(|c: char| !c.is_alphanumeric())
-            })
+            .map_or("", |p| display_name(&p.name))
     }
+}
+
+/// Drops leading emoji and punctuation from a project name.
+pub fn display_name(name: &str) -> &str {
+    name.trim_start_matches(|c: char| !c.is_alphanumeric())
 }
 
 const KEYCHAIN_SERVICE: &str = "asana-access-token";
@@ -152,7 +188,116 @@ pub fn my_tasks(workspace: &str, since: DateTime<Utc>) -> Result<Vec<Task>, Stri
         "--opt-fields",
         TASK_FIELDS,
     ])?;
-    serde_json::from_value(v).map_err(|e| format!("unexpected task shape: {e}"))
+    let mut tasks: Vec<Task> =
+        serde_json::from_value(v).map_err(|e| format!("unexpected task shape: {e}"))?;
+    for t in &mut tasks {
+        t.mine = true;
+    }
+    Ok(tasks)
+}
+
+/// My tasks first, then initiative tasks not already among them; shared ones get both flags.
+pub fn merge(mut mine: Vec<Task>, initiative: Vec<Task>) -> Vec<Task> {
+    for t in initiative {
+        match mine.iter_mut().find(|m| m.gid == t.gid) {
+            Some(m) => m.initiative = t.initiative,
+            None => mine.push(t),
+        }
+    }
+    mine
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusUpdate {
+    /// on_track, at_risk, off_track, on_hold or complete.
+    pub status_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Initiative {
+    pub gid: String,
+    pub name: String,
+    pub current_status_update: Option<StatusUpdate>,
+}
+
+/// Open projects that use the attention field.
+fn initiative_projects(workspace: &str) -> Result<Vec<Initiative>, String> {
+    let v = run(&[
+        "projects",
+        "search",
+        "--workspace",
+        workspace,
+        "--no-completed",
+        "--limit",
+        "100",
+        "--opt-fields",
+        "name,custom_field_settings.custom_field.name,\
+current_status_update.status_type,current_status_update.created_at",
+    ])?;
+    let uses_field = |p: &&Value| {
+        p["custom_field_settings"].as_array().is_some_and(|s| {
+            s.iter()
+                .any(|s| s["custom_field"]["name"] == ATTENTION_FIELD)
+        })
+    };
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter(uses_field)
+        .map(|p| decode(p.clone()))
+        .collect()
+}
+
+/// Open milestones and attention items across initiative projects. asana-cli can't
+/// filter search by custom field, so attention items are picked out here; each
+/// search returns at most 100 tasks.
+pub fn initiative_tasks(workspace: &str) -> Result<(Vec<Initiative>, Vec<Task>), String> {
+    let projects = initiative_projects(workspace)?;
+    if projects.is_empty() {
+        return Ok((projects, vec![]));
+    }
+    let any = projects
+        .iter()
+        .map(|p| p.gid.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let search = |subtype: &str| {
+        run(&[
+            "tasks",
+            "search",
+            "--workspace",
+            workspace,
+            "--projects.any",
+            &any,
+            "--resource-subtype",
+            subtype,
+            "--no-completed",
+            "--limit",
+            "100",
+            "--opt-fields",
+            TASK_FIELDS,
+        ])
+        .and_then(decode::<Vec<Task>>)
+    };
+    let (milestones, rest) = std::thread::scope(|s| {
+        let m = s.spawn(|| search("milestone"));
+        let rest = search("default_task");
+        (
+            m.join().unwrap_or_else(|_| Err("worker panicked".into())),
+            rest,
+        )
+    });
+    let mut tasks = milestones?;
+    tasks.extend(rest?.into_iter().filter(|t| t.attention().is_some()));
+    for t in &mut tasks {
+        t.initiative = t
+            .projects
+            .iter()
+            .find_map(|tp| projects.iter().find(|p| p.gid == tp.gid))
+            .map(|p| display_name(&p.name).to_string());
+    }
+    Ok((projects, tasks))
 }
 
 pub fn set_completed(gid: &str, done: bool) -> Result<(), String> {

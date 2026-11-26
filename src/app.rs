@@ -16,16 +16,50 @@ pub enum Tab {
     Today,
     MyTasks,
     Sessions,
+    Milestones,
+    Decisions,
+    Blockers,
+    Questions,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Today, Tab::MyTasks, Tab::Sessions];
+    pub const ALL: [Tab; 7] = [
+        Tab::Today,
+        Tab::MyTasks,
+        Tab::Sessions,
+        Tab::Milestones,
+        Tab::Decisions,
+        Tab::Blockers,
+        Tab::Questions,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Today => "Today",
             Tab::MyTasks => "My Tasks",
             Tab::Sessions => "Sessions",
+            Tab::Milestones => "Milestones",
+            Tab::Decisions => "Decisions",
+            Tab::Blockers => "Blockers",
+            Tab::Questions => "Questions",
+        }
+    }
+
+    pub fn is_initiative(self) -> bool {
+        matches!(
+            self,
+            Tab::Milestones | Tab::Decisions | Tab::Blockers | Tab::Questions
+        )
+    }
+
+    /// Whether an open initiative task belongs on this tab.
+    fn includes(self, task: &Task) -> bool {
+        match self {
+            Tab::Milestones => task.is_milestone(),
+            Tab::Decisions => task.attention() == Some("Decision"),
+            Tab::Blockers => task.attention() == Some("Blocker"),
+            Tab::Questions => task.attention() == Some("Question"),
+            _ => false,
         }
     }
 }
@@ -44,7 +78,7 @@ impl Row {
 }
 
 pub enum Msg {
-    Tasks(Result<(String, Vec<Task>), String>),
+    Tasks(Result<(String, Vec<Task>, Vec<asana::Initiative>), String>),
     Reload,
     Sessions(Vec<Session>),
     Status(String),
@@ -67,6 +101,7 @@ pub struct App {
     pub tab: Tab,
     pub tasks: Vec<Task>,
     pub sessions: Vec<Session>,
+    pub initiatives: Vec<asana::Initiative>,
     pub status: String,
     pub error: Option<String>,
     pub loading: bool,
@@ -98,6 +133,7 @@ impl App {
             tab: Tab::Today,
             tasks: vec![],
             sessions: vec![],
+            initiatives: vec![],
             status: String::new(),
             error: None,
             loading: false,
@@ -126,7 +162,7 @@ impl App {
     }
 
     pub fn done_count(&self) -> usize {
-        self.tasks.iter().filter(|t| t.completed).count()
+        self.tasks.iter().filter(|t| t.mine && t.completed).count()
     }
 
     pub fn refresh(&mut self) {
@@ -144,7 +180,22 @@ impl App {
                 .unwrap_or_else(asana::workspace)
                 .and_then(|ws| {
                     let since = Utc::now() - Duration::days(1);
-                    asana::my_tasks(&ws, since).map(|t| (ws, t))
+                    let (mine, initiative) = thread::scope(|s| {
+                        let initiative = s.spawn(|| asana::initiative_tasks(&ws));
+                        let mine = asana::my_tasks(&ws, since);
+                        (
+                            mine,
+                            initiative
+                                .join()
+                                .unwrap_or_else(|_| Err("worker panicked".into())),
+                        )
+                    });
+                    let initiative = initiative.unwrap_or_else(|e| {
+                        let _ = tx.send(Msg::Status(format!("initiatives: {e}")));
+                        (vec![], vec![])
+                    });
+                    let (initiatives, tasks) = initiative;
+                    mine.map(|m| (ws, asana::merge(m, tasks), initiatives))
                 });
             let _ = tx.send(Msg::Tasks(result));
         });
@@ -152,7 +203,8 @@ impl App {
 
     pub fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Tasks(Ok((ws, tasks))) => {
+            Msg::Tasks(Ok((ws, tasks, initiatives))) => {
+                self.initiatives = initiatives;
                 self.loading = false;
                 self.error = None;
                 self.workspace = Some(ws);
@@ -182,6 +234,7 @@ impl App {
             Tab::Today => self.today_rows(),
             Tab::MyTasks => self.section_rows(),
             Tab::Sessions => (0..self.sessions.len()).map(Row::Session).collect(),
+            tab => self.initiative_rows(tab),
         }
     }
 
@@ -189,7 +242,7 @@ impl App {
         let mut rows = vec![];
         for bucket in Bucket::TODAY_ORDER {
             let idx: Vec<usize> = (0..self.tasks.len())
-                .filter(|&i| self.bucket(&self.tasks[i]) == bucket)
+                .filter(|&i| self.tasks[i].mine && self.bucket(&self.tasks[i]) == bucket)
                 .collect();
             if idx.is_empty() {
                 continue;
@@ -204,7 +257,12 @@ impl App {
     /// Groups open tasks by My Tasks section, keeping Asana's section order.
     fn section_rows(&self) -> Vec<Row> {
         let mut sections: Vec<(&str, Vec<usize>)> = vec![];
-        for (i, t) in self.tasks.iter().enumerate().filter(|(_, t)| !t.completed) {
+        for (i, t) in self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.mine && !t.completed)
+        {
             match sections.iter_mut().find(|(name, _)| *name == t.section()) {
                 Some((_, v)) => v.push(i),
                 None => sections.push((t.section(), vec![i])),
@@ -217,6 +275,38 @@ impl App {
             rows.push(Row::Blank);
         }
         rows
+    }
+
+    /// Open initiative tasks for `tab`, grouped by project, soonest due first.
+    fn initiative_rows(&self, tab: Tab) -> Vec<Row> {
+        let mut idx: Vec<usize> = (0..self.tasks.len())
+            .filter(|&i| {
+                let t = &self.tasks[i];
+                t.initiative.is_some() && !t.completed && tab.includes(t)
+            })
+            .collect();
+        idx.sort_by_key(|&i| {
+            let t = &self.tasks[i];
+            (t.initiative.as_deref(), t.due_on.is_none(), t.due_on)
+        });
+        let mut rows = vec![];
+        for group in idx.chunk_by(|&a, &b| self.tasks[a].initiative == self.tasks[b].initiative) {
+            rows.push(Row::Header(
+                self.tasks[group[0]].initiative.clone().unwrap_or_default(),
+                group.len(),
+            ));
+            rows.extend(group.iter().copied().map(Row::Task));
+            rows.push(Row::Blank);
+        }
+        rows
+    }
+
+    /// Open items on an initiative tab, for the header badge.
+    pub fn initiative_count(&self, tab: Tab) -> usize {
+        self.tasks
+            .iter()
+            .filter(|t| t.initiative.is_some() && !t.completed && tab.includes(t))
+            .count()
     }
 
     fn selectable(&self) -> Vec<usize> {
