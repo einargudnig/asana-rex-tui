@@ -20,10 +20,11 @@ pub enum Tab {
     Decisions,
     Blockers,
     Questions,
+    Inbox,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [
+    pub const ALL: [Tab; 8] = [
         Tab::Today,
         Tab::MyTasks,
         Tab::Sessions,
@@ -31,6 +32,7 @@ impl Tab {
         Tab::Decisions,
         Tab::Blockers,
         Tab::Questions,
+        Tab::Inbox,
     ];
 
     pub fn title(self) -> &'static str {
@@ -42,6 +44,7 @@ impl Tab {
             Tab::Decisions => "Decisions",
             Tab::Blockers => "Blockers",
             Tab::Questions => "Questions",
+            Tab::Inbox => "Inbox",
         }
     }
 
@@ -69,11 +72,12 @@ pub enum Row {
     Blank,
     Task(usize),
     Session(usize),
+    Inbox(usize),
 }
 
 impl Row {
     fn selectable(&self) -> bool {
-        matches!(self, Row::Task(_) | Row::Session(_))
+        matches!(self, Row::Task(_) | Row::Session(_) | Row::Inbox(_))
     }
 }
 
@@ -83,6 +87,7 @@ pub enum Msg {
     Sessions(Vec<Session>),
     Status(String),
     Detail(String, Result<Box<asana::Detail>, String>),
+    Inbox(Result<Vec<asana::InboxItem>, String>),
     /// A comment was posted; drop the cached details so the pane refetches.
     Commented(String),
 }
@@ -110,6 +115,7 @@ pub struct App {
     pub tasks: Vec<Task>,
     pub sessions: Vec<Session>,
     pub initiatives: Vec<asana::Initiative>,
+    pub inbox: Vec<asana::InboxItem>,
     pub status: String,
     pub error: Option<String>,
     pub loading: bool,
@@ -144,6 +150,7 @@ impl App {
             tasks: vec![],
             sessions: vec![],
             initiatives: vec![],
+            inbox: vec![],
             status: String::new(),
             error: None,
             loading: false,
@@ -191,16 +198,21 @@ impl App {
                 .unwrap_or_else(asana::workspace)
                 .and_then(|ws| {
                     let since = Utc::now() - Duration::days(1);
-                    let (mine, initiative) = thread::scope(|s| {
+                    let (mine, initiative, inbox) = thread::scope(|s| {
                         let initiative = s.spawn(|| asana::initiative_tasks(&ws));
+                        let inbox = s.spawn(|| asana::inbox(&ws));
                         let mine = asana::my_tasks(&ws, since);
                         (
                             mine,
                             initiative
                                 .join()
                                 .unwrap_or_else(|_| Err("worker panicked".into())),
+                            inbox
+                                .join()
+                                .unwrap_or_else(|_| Err("worker panicked".into())),
                         )
                     });
+                    let _ = tx.send(Msg::Inbox(inbox));
                     let initiative = initiative.unwrap_or_else(|e| {
                         let _ = tx.send(Msg::Status(format!("initiatives: {e}")));
                         (vec![], vec![])
@@ -228,8 +240,18 @@ impl App {
             Msg::Sessions(s) => self.sessions = s,
             Msg::Status(s) => self.status = s,
             Msg::Reload => self.refresh(),
+            Msg::Inbox(Ok(items)) => {
+                self.inbox = items;
+                for item in &mut self.inbox {
+                    if let Some(t) = self.tasks.iter().find(|t| t.gid == item.task.gid) {
+                        item.task = t.clone();
+                    }
+                }
+            }
+            Msg::Inbox(Err(e)) => self.status = format!("inbox: {e}"),
             Msg::Commented(gid) => {
                 self.details.remove(&gid);
+                self.mark_read(&gid);
             }
             Msg::Detail(gid, r) => {
                 let state = r.map_or_else(DetailState::Failed, DetailState::Ready);
@@ -248,6 +270,7 @@ impl App {
             Tab::Today => self.today_rows(),
             Tab::MyTasks => self.section_rows(),
             Tab::Sessions => (0..self.sessions.len()).map(Row::Session).collect(),
+            Tab::Inbox => (0..self.inbox.len()).map(Row::Inbox).collect(),
             tab => self.initiative_rows(tab),
         }
     }
@@ -379,6 +402,7 @@ impl App {
     pub fn selected_task(&self) -> Option<&Task> {
         match self.rows().get(self.selected_row()?)? {
             Row::Task(i) => self.tasks.get(*i),
+            Row::Inbox(i) => self.inbox.get(*i).map(|item| &item.task),
             _ => None,
         }
     }
@@ -388,6 +412,7 @@ impl App {
         match rows.get(self.selected_row()?)? {
             Row::Session(i) => self.sessions.get(*i),
             Row::Task(i) => rex::session_for(&self.tasks[*i], &self.sessions),
+            Row::Inbox(i) => rex::session_for(&self.inbox[*i].task, &self.sessions),
             _ => None,
         }
     }
@@ -486,7 +511,36 @@ impl App {
         self.status = format!("opened {}", task.name);
     }
 
-    /// c: open the comment input for the selected task.
+    /// m: mark the selected inbox item read.
+    pub fn mark_selected_read(&mut self) {
+        if self.tab != Tab::Inbox {
+            return;
+        }
+        if let Some(gid) = self.selected_task().map(|t| t.gid.clone()) {
+            self.mark_read(&gid);
+        }
+    }
+
+    /// Drops the task's inbox item and marks its notifications read in Asana.
+    fn mark_read(&mut self, task_gid: &str) {
+        let Some(pos) = self.inbox.iter().position(|i| i.task.gid == task_gid) else {
+            return;
+        };
+        let Some(ws) = self.workspace.clone() else {
+            return;
+        };
+        let item = self.inbox.remove(pos);
+        self.clamp_cursor();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            if let Err(e) = asana::mark_read(&ws, &item.notification_gids) {
+                let _ = tx.send(Msg::Status(format!("couldn't mark read: {e}")));
+                let _ = tx.send(Msg::Reload);
+            }
+        });
+    }
+
+    /// a: open the comment input for the selected task.
     pub fn start_comment(&mut self) {
         let Some(task) = self.selected_task() else {
             return;

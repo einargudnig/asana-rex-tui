@@ -39,6 +39,7 @@ Re-run the same command after changing the code; it replaces the installed binar
   - *Done since yesterday*.
 - **2 My Tasks**: all open tasks, grouped by My Tasks section in Asana's order.
 - **3 Sessions**: open Rex sessions that belong to a task.
+- **8 Inbox**: your unread Asana comments and assignments, one row per task, newest first, with who sent the latest and how many more there are. Other notifications (likes, due date changes, …) are left out. `m` marks an item read in Asana, and replying with `a` marks it read too.
 - **4 Milestones**, **5 Decisions**, **6 Blockers**, **7 Questions**: open items across initiative projects, grouped by project, soonest due first. The right-hand column shows the assignee instead of the project.
   - An initiative project is any open project that uses the `Attention type` custom field.
   - Decisions, Blockers and Questions are tasks whose `Attention type` is `Decision`, `Blocker` or `Question`. Milestones are milestone tasks.
@@ -58,12 +59,13 @@ Tasks reload every 2 minutes and on `r`.
 |---|---|
 | `j` / `k`, ↓ / ↑ | Move |
 | `g` / `G` | First / last task |
-| `1`–`7`, `h` / `l`, Tab | Switch view (Tab switches focus while details are open) |
+| `1`–`8`, `h` / `l`, Tab | Switch view (Tab switches focus while details are open) |
 | `enter` | Focus the task's Rex session, or start one running Claude |
 | `space` / `p` | Toggle the details pane |
 | `J` / `K` | Scroll the details pane by 3 lines |
 | `o` | Open the task in the browser |
 | `x` | Mark done / reopen |
+| `m` | Mark read (Inbox) |
 | `a` | Add a comment: `^s` posts, `enter` starts a new line (shown as `↵`), `esc` cancels, `^u` clears |
 | `r` | Refresh |
 | `?` | Show all keys |

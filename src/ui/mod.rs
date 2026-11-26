@@ -82,6 +82,16 @@ fn due_color(due: NaiveDate, done: bool) -> Color {
     }
 }
 
+/// "5m", "3h", "2d" since `at`.
+fn age(at: chrono::DateTime<chrono::Utc>) -> String {
+    let mins = (chrono::Utc::now() - at).num_minutes().max(0);
+    match mins {
+        m if m < 60 => format!("{m}m"),
+        m if m < 60 * 24 => format!("{}h", m / 60),
+        m => format!("{}d", m / (60 * 24)),
+    }
+}
+
 /// The page on initiative projects asks owners to set a status every week.
 const STATUS_STALE_DAYS: i64 = 7;
 
@@ -179,6 +189,13 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     match app.tab {
         crate::app::Tab::Sessions => vec![("enter", "focus"), ("r", "refresh"), ("?", "keys")],
+        crate::app::Tab::Inbox => vec![
+            ("a", "reply"),
+            ("m", "mark read"),
+            ("space", "details"),
+            ("o", "open"),
+            ("?", "keys"),
+        ],
         _ if app.detail_open => vec![
             ("tab", "details"),
             ("enter", "launch"),
@@ -206,10 +223,10 @@ fn hint_width(hints: &[(&str, &str)]) -> usize {
         .saturating_sub(3)
 }
 
-const HELP: [(&str, &str); 16] = [
+const HELP: [(&str, &str); 17] = [
     ("j / k", "move"),
     ("g / G", "first / last"),
-    ("1–7, h / l", "switch view"),
+    ("1–8, h / l", "switch view"),
     ("enter", "focus or launch a Claude session"),
     ("space / p", "toggle details"),
     ("tab", "focus details (when open)"),
@@ -217,6 +234,7 @@ const HELP: [(&str, &str); 16] = [
     ("o", "open in browser"),
     ("x", "mark done / reopen"),
     ("a", "add a comment (^s posts)"),
+    ("m", "mark read (Inbox)"),
     ("r", "refresh"),
     ("q / esc", "quit"),
     ("", ""),
@@ -299,8 +317,16 @@ fn tab_spans(app: &App, compact: bool) -> Vec<Span<'static>> {
             (false, true) => (i + 1).to_string().fg(DIM),
             (false, false) => t.title().fg(DIM),
         });
-        let n = app.initiative_count(t);
-        if matches!(t, Tab::Decisions | Tab::Blockers | Tab::Questions) && n > 0 {
+        let n = if t == Tab::Inbox {
+            app.inbox.len()
+        } else {
+            app.initiative_count(t)
+        };
+        if matches!(
+            t,
+            Tab::Decisions | Tab::Blockers | Tab::Questions | Tab::Inbox
+        ) && n > 0
+        {
             let color = match t {
                 Tab::Blockers => LATE,
                 Tab::Decisions => WARN,
@@ -515,6 +541,37 @@ fn row_line<'a>(
                 " ".into(),
                 fit(right_column(app, t), project_w).fg(DIM),
                 session,
+            ])
+        }
+        Row::Inbox(i) => {
+            let item = &app.inbox[*i];
+            let first = item.actor.split_whitespace().next().unwrap_or("someone");
+            let verb = if item.kind == "assigned" {
+                "assigned"
+            } else {
+                "commented"
+            };
+            let more = match item.notification_gids.len() {
+                1 => String::new(),
+                n => format!(" +{}", n - 1),
+            };
+            Line::from(vec![
+                marker,
+                format!(" {}", fit(&age(item.at), DUE_W)).fg(DIM),
+                " ".into(),
+                // Without room for the right column, the sender leads the name instead.
+                if project_w == 0 {
+                    Span::from(fit(&format!("{first}: {}", item.task.name), name_w)).fg(TEXT)
+                } else {
+                    fit(&item.task.name, name_w).fg(TEXT)
+                },
+                " ".into(),
+                fit(&format!("{first} {verb}{more}"), project_w).fg(DIM),
+                if has_session(app, &item.task) {
+                    " ●".fg(WARN)
+                } else {
+                    "  ".into()
+                },
             ])
         }
         Row::Session(i) => {

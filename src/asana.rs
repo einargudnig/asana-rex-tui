@@ -11,7 +11,7 @@ permalink_url,resource_subtype,assignee.name,custom_fields.name,custom_fields.di
 /// on the tasks in their "Needs attention" section.
 const ATTENTION_FIELD: &str = "Attention type";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Named {
     #[serde(default)]
     pub gid: String,
@@ -19,7 +19,7 @@ pub struct Named {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Task {
     pub gid: String,
     pub name: String,
@@ -304,6 +304,100 @@ pub fn add_comment(gid: &str, text: &str) -> Result<(), String> {
     run(&["stories", "create", "--task", gid, "--text", text]).map(|_| ())
 }
 
+/// Notification kinds the Inbox shows; the rest (likes, due date moves, …) is noise.
+const INBOX_KINDS: [&str; 2] = ["comment_added", "assigned"];
+
+#[derive(Debug, Clone, Deserialize)]
+struct Notification {
+    gid: String,
+    created_at: DateTime<Utc>,
+    created_by: Option<Named>,
+    #[serde(default)]
+    is_read: bool,
+    #[serde(default)]
+    story_resource_subtype: String,
+    #[serde(default)]
+    work_objects: Vec<WorkObject>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkObject {
+    gid: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    resource_type: String,
+}
+
+/// One task's unread comments and assignments, newest first.
+#[derive(Debug, Clone)]
+pub struct InboxItem {
+    pub task: Task,
+    pub notification_gids: Vec<String>,
+    pub actor: String,
+    /// The newest notification's kind: "comment_added" or "assigned".
+    pub kind: String,
+    pub at: DateTime<Utc>,
+}
+
+/// Unread comments and assignments, grouped by task, newest first.
+pub fn inbox(workspace: &str) -> Result<Vec<InboxItem>, String> {
+    let v = run(&[
+        "notifications",
+        "list",
+        "--user",
+        "me",
+        "--workspace",
+        workspace,
+        "--max-results",
+        "200",
+    ])?;
+    let mut notes: Vec<Notification> = decode(v)?;
+    notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+    let mut items: Vec<InboxItem> = vec![];
+    for n in notes {
+        if n.is_read || !INBOX_KINDS.contains(&n.story_resource_subtype.as_str()) {
+            continue;
+        }
+        let Some(obj) = n.work_objects.iter().find(|o| o.resource_type == "task") else {
+            continue;
+        };
+        if let Some(item) = items.iter_mut().find(|i| i.task.gid == obj.gid) {
+            item.notification_gids.push(n.gid);
+            continue;
+        }
+        items.push(InboxItem {
+            task: Task {
+                gid: obj.gid.clone(),
+                name: obj.name.clone(),
+                permalink_url: format!("https://app.asana.com/0/0/{}/f", obj.gid),
+                ..Task::default()
+            },
+            notification_gids: vec![n.gid],
+            actor: n.created_by.map(|u| u.name).unwrap_or_default(),
+            kind: n.story_resource_subtype,
+            at: n.created_at,
+        });
+    }
+    Ok(items)
+}
+
+pub fn mark_read(workspace: &str, gids: &[String]) -> Result<(), String> {
+    let mut args = vec![
+        "notifications",
+        "update",
+        "--user",
+        "me",
+        "--workspace",
+        workspace,
+        "--read",
+    ];
+    for g in gids.iter().take(50) {
+        args.extend(["--notification-gids", g.as_str()]);
+    }
+    run(&args).map(|_| ())
+}
+
 pub fn set_completed(gid: &str, done: bool) -> Result<(), String> {
     let flag = if done {
         "--completed"
@@ -319,7 +413,7 @@ pub struct Membership {
     pub section: Option<Named>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CustomField {
     pub name: String,
     pub display_value: Option<String>,
