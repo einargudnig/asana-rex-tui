@@ -27,7 +27,29 @@ fn on_detail_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     true
 }
 
+/// Keys while the comment input is open; it takes every key.
+fn on_composer_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    let Some(c) = app.composer.as_mut() else {
+        return;
+    };
+    match code {
+        KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.post_comment(),
+        KeyCode::Enter => c.text.push('\n'),
+        KeyCode::Esc => app.composer = None,
+        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => app.composer = None,
+        KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => c.text.clear(),
+        KeyCode::Backspace => {
+            c.text.pop();
+        }
+        KeyCode::Char(ch) => c.text.push(ch),
+        _ => {}
+    }
+}
+
 fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if app.composer.is_some() {
+        return on_composer_key(app, code, mods);
+    }
     if app.help {
         app.help = false;
         return;
@@ -55,6 +77,7 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Enter => app.launch_or_focus(),
         KeyCode::Char('o') => app.open_in_browser(),
         KeyCode::Char('x') => app.toggle_complete(),
+        KeyCode::Char('a') => app.start_comment(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('?') => app.help = true,
         KeyCode::Char(' ') | KeyCode::Char('p') => app.toggle_detail(),

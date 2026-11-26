@@ -83,6 +83,8 @@ pub enum Msg {
     Sessions(Vec<Session>),
     Status(String),
     Detail(String, Result<Box<asana::Detail>, String>),
+    /// A comment was posted; drop the cached details so the pane refetches.
+    Commented(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +97,12 @@ pub enum DetailState {
     Loading,
     Ready(Box<asana::Detail>),
     Failed(String),
+}
+
+pub struct Composer {
+    pub gid: String,
+    pub task_name: String,
+    pub text: String,
 }
 
 pub struct App {
@@ -114,6 +122,8 @@ pub struct App {
     pub detail_max_scroll: Cell<u16>,
     pub focus: Focus,
     pub help: bool,
+    /// Comment being typed, and the task it goes on; `Some` while the input is open.
+    pub composer: Option<Composer>,
     hovered: Option<(String, Instant)>,
     workspace: Option<String>,
     cwd: String,
@@ -145,6 +155,7 @@ impl App {
             detail_max_scroll: Cell::new(0),
             focus: Focus::List,
             help: false,
+            composer: None,
             hovered: None,
             workspace: None,
             cwd,
@@ -217,6 +228,9 @@ impl App {
             Msg::Sessions(s) => self.sessions = s,
             Msg::Status(s) => self.status = s,
             Msg::Reload => self.refresh(),
+            Msg::Commented(gid) => {
+                self.details.remove(&gid);
+            }
             Msg::Detail(gid, r) => {
                 let state = r.map_or_else(DetailState::Failed, DetailState::Ready);
                 self.details.insert(gid, state);
@@ -470,6 +484,41 @@ impl App {
             .arg(&task.permalink_url)
             .spawn();
         self.status = format!("opened {}", task.name);
+    }
+
+    /// c: open the comment input for the selected task.
+    pub fn start_comment(&mut self) {
+        let Some(task) = self.selected_task() else {
+            return;
+        };
+        self.composer = Some(Composer {
+            gid: task.gid.clone(),
+            task_name: task.name.clone(),
+            text: String::new(),
+        });
+    }
+
+    /// ^s in the comment input: posts in the background; empty input just closes.
+    pub fn post_comment(&mut self) {
+        let Some(c) = self.composer.take() else {
+            return;
+        };
+        let text = c.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.status = format!("posting comment on {}…", c.task_name);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let msg = match asana::add_comment(&c.gid, &text) {
+                Ok(()) => {
+                    let _ = tx.send(Msg::Commented(c.gid));
+                    format!("commented on {}", c.task_name)
+                }
+                Err(e) => format!("comment failed on {}: {e}", c.task_name),
+            };
+            let _ = tx.send(Msg::Status(msg));
+        });
     }
 
     /// Optimistic toggle; reloads from Asana on failure.

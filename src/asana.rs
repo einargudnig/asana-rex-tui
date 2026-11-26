@@ -300,6 +300,10 @@ pub fn initiative_tasks(workspace: &str) -> Result<(Vec<Initiative>, Vec<Task>),
     Ok((projects, tasks))
 }
 
+pub fn add_comment(gid: &str, text: &str) -> Result<(), String> {
+    run(&["stories", "create", "--task", gid, "--text", text]).map(|_| ())
+}
+
 pub fn set_completed(gid: &str, done: bool) -> Result<(), String> {
     let flag = if done {
         "--completed"

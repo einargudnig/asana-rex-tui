@@ -64,6 +64,7 @@ Tasks reload every 2 minutes and on `r`.
 | `J` / `K` | Scroll the details pane by 3 lines |
 | `o` | Open the task in the browser |
 | `x` | Mark done / reopen |
+| `a` | Add a comment: `^s` posts, `enter` starts a new line (shown as `↵`), `esc` cancels, `^u` clears |
 | `r` | Refresh |
 | `?` | Show all keys |
 | `q`, `Esc`, `^c` | Quit |

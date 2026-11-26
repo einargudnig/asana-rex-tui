@@ -182,6 +182,7 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         _ if app.detail_open => vec![
             ("tab", "details"),
             ("enter", "launch"),
+            ("a", "comment"),
             ("x", "done"),
             ("space", "close"),
             ("?", "keys"),
@@ -189,6 +190,7 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         _ => vec![
             ("enter", "launch"),
             ("space", "details"),
+            ("a", "comment"),
             ("x", "done"),
             ("o", "open"),
             ("?", "keys"),
@@ -204,7 +206,7 @@ fn hint_width(hints: &[(&str, &str)]) -> usize {
         .saturating_sub(3)
 }
 
-const HELP: [(&str, &str); 15] = [
+const HELP: [(&str, &str); 16] = [
     ("j / k", "move"),
     ("g / G", "first / last"),
     ("1–7, h / l", "switch view"),
@@ -214,6 +216,7 @@ const HELP: [(&str, &str); 15] = [
     ("J / K", "scroll details from the list"),
     ("o", "open in browser"),
     ("x", "mark done / reopen"),
+    ("a", "add a comment (^s posts)"),
     ("r", "refresh"),
     ("q / esc", "quit"),
     ("", ""),
@@ -329,7 +332,51 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(right.right_aligned()), area);
 }
 
+/// The comment input replaces the footer while open; long text scrolls to keep the end visible.
+fn draw_composer(f: &mut Frame, c: &crate::app::Composer, area: Rect) {
+    let width = area.width as usize;
+    let hint = if width >= 100 {
+        "^s post · enter new line · esc cancel "
+    } else {
+        "^s post "
+    };
+    let room = width.saturating_sub(hint.width() + 2);
+    let name_w = (width / 4).clamp(8, 24);
+    let label = format!(" comment on {}: ", fit(&c.task_name, name_w).trim_end());
+    let text_room = room.saturating_sub(label.width() + 1);
+    let mut shown: Vec<char> = vec![];
+    let mut used = 0;
+    for ch in c
+        .text
+        .chars()
+        .rev()
+        .map(|ch| if ch == '\n' { '↵' } else { ch })
+    {
+        used += ch.width().unwrap_or(0);
+        if used > text_room {
+            break;
+        }
+        shown.push(ch);
+    }
+    let shown: String = shown.into_iter().rev().collect();
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            label.fg(ACCENT),
+            shown.fg(TEXT),
+            "█".fg(ACCENT),
+        ])),
+        area,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(hint.fg(DIM)).right_aligned()),
+        area,
+    );
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    if let Some(c) = &app.composer {
+        return draw_composer(f, c, area);
+    }
     let left = if app.status.is_empty() {
         format!(
             " {} · {} done since yesterday",
