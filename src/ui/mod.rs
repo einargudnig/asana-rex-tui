@@ -1,7 +1,7 @@
 mod detail;
 
 use crate::app::{App, Row, Tab};
-use crate::asana::Task;
+use crate::asana::{Project, StatusUpdate, Task};
 use crate::buckets::Bucket;
 use crate::rex;
 use chrono::{Local, NaiveDate};
@@ -95,40 +95,47 @@ fn age(at: chrono::DateTime<chrono::Utc>) -> String {
 /// The page on initiative projects asks owners to set a status every week.
 const STATUS_STALE_DAYS: i64 = 7;
 
+fn status_label(update: &StatusUpdate) -> (String, Color) {
+    match update.status_type.as_str() {
+        "on_track" => ("on track".into(), DONE),
+        "at_risk" => ("at risk".into(), WARN),
+        "off_track" => ("off track".into(), LATE),
+        "on_hold" => ("on hold".into(), DIM),
+        "complete" => ("complete".into(), DONE),
+        other => (other.replace('_', " "), DIM),
+    }
+}
+
+fn status_age_days(update: &StatusUpdate) -> i64 {
+    (Local::now().date_naive() - update.created_at.with_timezone(&Local).date_naive()).num_days()
+}
+
 /// "● on track · 3d", amber when older than a week, "no status" when never set.
-fn project_status(app: &App, project: &str) -> Option<Line<'static>> {
-    let projects = if app.tab == Tab::Projects {
-        &app.projects
-    } else {
-        &app.initiatives
+fn status_line(update: Option<&StatusUpdate>) -> Line<'static> {
+    let Some(update) = update else {
+        return Line::from("no status".fg(WARN));
     };
-    let initiative = projects
+    let (label, color) = status_label(update);
+    let age = status_age_days(update);
+    let age_color = if age > STATUS_STALE_DAYS { WARN } else { DIM };
+    Line::from(vec![
+        "● ".fg(color),
+        label.fg(color),
+        format!(" · {age}d").fg(age_color),
+    ])
+}
+
+fn project_status(app: &App, project: &str) -> Option<Line<'static>> {
+    let initiative = app
+        .initiatives
         .iter()
         .find(|i| crate::asana::display_name(&i.name) == project)?;
-    let Some(update) = &initiative.current_status_update else {
-        return Some(Line::from("no status".fg(WARN)));
-    };
-    let (label, color) = match update.status_type.as_str() {
-        "on_track" => ("on track", DONE),
-        "at_risk" => ("at risk", WARN),
-        "off_track" => ("off track", LATE),
-        "on_hold" => ("on hold", DIM),
-        "complete" => ("complete", DONE),
-        other => (other, DIM),
-    };
-    let age = (Local::now().date_naive() - update.created_at.with_timezone(&Local).date_naive())
-        .num_days();
-    let age_color = if age > STATUS_STALE_DAYS { WARN } else { DIM };
-    Some(Line::from(vec![
-        "● ".fg(color),
-        label.to_string().fg(color),
-        format!(" · {age}d").fg(age_color),
-    ]))
+    Some(status_line(initiative.current_status_update.as_ref()))
 }
 
 /// Initiative tabs group by project, so the column shows who owns the item instead.
 fn right_column<'a>(app: &App, task: &'a Task) -> &'a str {
-    if app.tab.groups_by_project() {
+    if app.tab.is_initiative() {
         task.assignee_name()
     } else {
         task.project()
@@ -145,7 +152,7 @@ fn is_done(app: &App, task: &Task) -> bool {
 
 /// Splits the body into list and, when the details pane is showing, the pane.
 fn split_body(app: &App, area: Rect, gap: u16) -> (Rect, Option<Rect>) {
-    if !app.detail_open || app.selected_task().is_none() {
+    if !app.detail_open || !app.has_detail() {
         return (area, None);
     }
     let [list, pane] = if area.width >= SIDE_BY_SIDE_W {
@@ -193,6 +200,12 @@ fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     match app.tab {
         crate::app::Tab::Sessions => vec![("enter", "focus"), ("r", "refresh"), ("?", "keys")],
+        crate::app::Tab::Projects => vec![
+            ("space", "overview"),
+            ("o", "open"),
+            ("r", "refresh"),
+            ("?", "keys"),
+        ],
         crate::app::Tab::Inbox => vec![
             ("a", "reply"),
             ("m", "mark read"),
@@ -439,8 +452,13 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         return draw_error(f, err, area);
     }
     let (list, pane) = split_body(app, area, 2);
-    if let (Some(pane), Some(task)) = (pane, app.selected_task()) {
-        detail::draw(f, app, task, pane, pane.x == list.x);
+    if let Some(pane) = pane {
+        let stacked = pane.x == list.x;
+        if let Some(task) = app.selected_task() {
+            detail::draw(f, app, task, pane, stacked);
+        } else if let Some(project) = app.selected_project() {
+            detail::draw_project(f, app, project, pane, stacked);
+        }
     }
     draw_list(f, app, list);
 }
@@ -500,7 +518,7 @@ fn row_line<'a>(
     match row {
         Row::Blank => Line::from(""),
         Row::Header(title, n) => {
-            let status = if app.tab.groups_by_project() {
+            let status = if app.tab.is_initiative() {
                 project_status(app, title)
             } else {
                 None
@@ -578,6 +596,7 @@ fn row_line<'a>(
                 },
             ])
         }
+        Row::Project(i) => project_line(&app.projects[*i], marker, name_w, project_w),
         Row::Session(i) => {
             let s = &app.sessions[*i];
             Line::from(vec![
@@ -589,4 +608,44 @@ fn row_line<'a>(
             ])
         }
     }
+}
+
+/// "7/11" done, or "" when the counts didn't load.
+fn progress(p: &Project) -> String {
+    p.counts
+        .as_ref()
+        .filter(|c| c.num_tasks > 0)
+        .map_or(String::new(), |c| {
+            format!("{}/{} done", c.num_completed_tasks, c.num_tasks)
+        })
+}
+
+/// Due date, name with progress, and the status in the right column (or a dot when narrow).
+fn project_line<'a>(p: &Project, marker: Span<'a>, name_w: usize, project_w: usize) -> Line<'a> {
+    let due = match p.due_on {
+        Some(d) => format!(" {}", fit(&relative_due(d), DUE_W)).fg(due_color(d, false)),
+        None => " ".repeat(DUE_W + 1).into(),
+    };
+    let done = progress(p);
+    let name_room = name_w.saturating_sub(done.width() + 2);
+    let name = fit(crate::asana::display_name(&p.name), name_room);
+    let status = status_line(p.current_status_update.as_ref());
+    let mut spans = vec![
+        marker,
+        due,
+        " ".into(),
+        name.fg(TEXT),
+        format!("{done:>w$}", w = name_w - name_room).fg(DIM),
+        " ".into(),
+    ];
+    if project_w == 0 {
+        spans.push(match &p.current_status_update {
+            Some(u) => "●".fg(status_label(u).1),
+            None => "○".fg(WARN),
+        });
+    } else {
+        spans.push(" ".repeat(project_w.saturating_sub(status.width())).into());
+        spans.extend(status.spans);
+    }
+    Line::from(spans)
 }

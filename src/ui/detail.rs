@@ -372,3 +372,132 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, scroll: u16, max: u16, focused: boo
         .thumb_style(Style::new().fg(if focused { ACCENT } else { DIM }));
     f.render_stateful_widget(bar, area, &mut state);
 }
+
+const BAR_W: usize = 20;
+
+/// "████████░░░░  40%" from done/total.
+fn bar(done: usize, total: usize) -> Vec<Span<'static>> {
+    let filled = (done * BAR_W).checked_div(total).unwrap_or(0);
+    let pct = (done * 100).checked_div(total).unwrap_or(0);
+    vec![
+        "█".repeat(filled).fg(DONE),
+        "░".repeat(BAR_W - filled).fg(FAINT),
+        format!("  {pct}%").fg(DIM),
+    ]
+}
+
+fn project_facts(p: &Project, width: usize) -> Vec<Line<'static>> {
+    let text = Style::new().fg(TEXT);
+    let dim = Style::new().fg(DIM);
+    let mut lines = vec![];
+    if let Some(c) = &p.counts {
+        let open = c.num_tasks - c.num_completed_tasks;
+        let mut v = words(&format!("{open} open"), text);
+        v.push(("·".into(), Style::new().fg(FAINT)));
+        v.extend(words(&format!("{} done", c.num_completed_tasks), dim));
+        if c.num_incomplete_milestones > 0 {
+            v.push(("·".into(), Style::new().fg(FAINT)));
+            v.extend(words(
+                &format!("{} milestones to go", c.num_incomplete_milestones),
+                dim,
+            ));
+        }
+        lines.extend(labeled("tasks", v, width));
+        if c.num_tasks > 0 {
+            lines.push(Line::from(
+                [
+                    vec![" ".repeat(LABEL_W).into()],
+                    bar(c.num_completed_tasks, c.num_tasks),
+                ]
+                .concat(),
+            ));
+        }
+    }
+    if let Some(start) = p.start_on {
+        lines.extend(labeled(
+            "start",
+            words(&start.format("%a, %b %-d").to_string(), text),
+            width,
+        ));
+    }
+    match p.due_on {
+        Some(due) => {
+            let mut v = words(&due.format("%a, %b %-d").to_string(), text);
+            v.push(("·".into(), Style::new().fg(FAINT)));
+            v.extend(words(
+                &relative_due(due),
+                Style::new().fg(due_color(due, false)),
+            ));
+            lines.extend(labeled("due", v, width));
+        }
+        None => lines.extend(labeled("due", words("not set", dim), width)),
+    }
+    if !p.members.is_empty() {
+        lines.extend(labeled("members", words(&names(&p.members), dim), width));
+    }
+    lines
+}
+
+/// The latest status update: verdict, title, who and when, then its text.
+fn project_status_lines(p: &Project, width: usize) -> Vec<Line<'static>> {
+    let Some(u) = &p.current_status_update else {
+        return vec![Line::from(
+            "No status update yet. Post one in Asana so people know where this stands.".fg(WARN),
+        )];
+    };
+    let (label, color) = status_label(u);
+    let age = status_age_days(u);
+    let mut head = vec!["● ".fg(color), label.bold().fg(color)];
+    if !u.title.trim().is_empty() {
+        head.push("  ".into());
+        head.push(u.title.trim().to_string().fg(TEXT));
+    }
+    let who = u.author.as_ref().map_or("someone", |a| a.name.as_str());
+    let when = u
+        .created_at
+        .with_timezone(&Local)
+        .format("%b %-d")
+        .to_string();
+    let age_color = if age > STATUS_STALE_DAYS { WARN } else { FAINT };
+    let mut lines = vec![
+        Line::from(head),
+        Line::from(vec![
+            format!("{who} · {when} · ").fg(FAINT),
+            format!("{age}d ago").fg(age_color),
+        ]),
+    ];
+    if !u.text.trim().is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(rich_text(&u.text, width, 0, &HashMap::new()));
+    }
+    lines
+}
+
+pub(super) fn draw_project(f: &mut Frame, app: &App, p: &Project, area: Rect, stacked: bool) {
+    let focused = app.detail_focused();
+    let borders = if stacked { Borders::TOP } else { Borders::LEFT };
+    let block = Block::new()
+        .borders(borders)
+        .border_style(Style::new().fg(if focused { ACCENT } else { RULE }))
+        .padding(Padding::new(2, 2, u16::from(stacked), 0));
+    let width = block.inner(area).width as usize;
+    let mut lines = vec![Line::from(
+        crate::asana::display_name(&p.name)
+            .to_string()
+            .bold()
+            .fg(TEXT),
+    )];
+    if let Some(team) = &p.team {
+        lines.push(Line::from(team.name.clone().fg(DIM)));
+    }
+    lines.push(Line::from(""));
+    lines.extend(project_facts(p, width));
+    lines.extend(heading("Status", String::new(), width));
+    lines.extend(project_status_lines(p, width));
+    if !p.notes.trim().is_empty() {
+        lines.extend(heading("Overview", String::new(), width));
+        lines.extend(rich_text(&p.notes, width, 0, &HashMap::new()));
+    }
+    let (scroll, max) = draw_scrolled(f, app, lines, block, area);
+    draw_scrollbar(f, area, scroll, max, focused);
+}

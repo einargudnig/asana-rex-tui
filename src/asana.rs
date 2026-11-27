@@ -43,9 +43,6 @@ pub struct Task {
     /// Name of the initiative project it lives in; only these show in the initiative tabs.
     #[serde(skip)]
     pub initiative: Option<String>,
-    /// Name of the project I own that it lives in; only these show in the Projects tab.
-    #[serde(skip)]
-    pub my_project: Option<String>,
 }
 
 impl Task {
@@ -203,10 +200,7 @@ pub fn my_tasks(workspace: &str, since: DateTime<Utc>) -> Result<Vec<Task>, Stri
 pub fn merge(mut tasks: Vec<Task>, more: Vec<Task>) -> Vec<Task> {
     for t in more {
         match tasks.iter_mut().find(|m| m.gid == t.gid) {
-            Some(m) => {
-                m.initiative = m.initiative.take().or(t.initiative);
-                m.my_project = m.my_project.take().or(t.my_project);
-            }
+            Some(m) => m.initiative = m.initiative.take().or(t.initiative),
             None => tasks.push(t),
         }
     }
@@ -218,6 +212,11 @@ pub struct StatusUpdate {
     /// on_track, at_risk, off_track, on_hold or complete.
     pub status_type: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub text: String,
+    pub author: Option<Named>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -306,16 +305,73 @@ pub fn initiative_tasks(workspace: &str) -> Result<(Vec<Initiative>, Vec<Task>),
     Ok((projects, tasks))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct OwnedProject {
-    #[serde(flatten)]
-    project: Initiative,
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskCounts {
     #[serde(default)]
-    archived: bool,
+    pub num_tasks: usize,
+    #[serde(default)]
+    pub num_completed_tasks: usize,
+    #[serde(default)]
+    pub num_incomplete_milestones: usize,
 }
 
-/// Open, unarchived projects I own, by name.
-fn owned_projects(workspace: &str) -> Result<Vec<Initiative>, String> {
+/// A project I own, with what the Projects tab needs to give an overview of it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Project {
+    pub gid: String,
+    pub name: String,
+    #[serde(default)]
+    pub notes: String,
+    pub due_on: Option<NaiveDate>,
+    pub start_on: Option<NaiveDate>,
+    #[serde(default)]
+    pub permalink_url: String,
+    pub team: Option<Named>,
+    #[serde(default)]
+    pub members: Vec<Named>,
+    pub current_status_update: Option<StatusUpdate>,
+    #[serde(default)]
+    archived: bool,
+    /// Fetched separately; `None` when that call failed.
+    #[serde(skip)]
+    pub counts: Option<TaskCounts>,
+}
+
+const PROJECT_FIELDS: &str = "name,archived,notes,due_on,start_on,permalink_url,team.name,\
+members.name,current_status_update.status_type,current_status_update.created_at,\
+current_status_update.title,current_status_update.text,current_status_update.author.name";
+
+fn task_counts(project: &str) -> Result<TaskCounts, String> {
+    run(&[
+        "projects",
+        "show",
+        "--project",
+        project,
+        "--task-counts",
+        "--opt-fields",
+        "num_tasks,num_completed_tasks,num_incomplete_milestones",
+    ])
+    .and_then(decode)
+}
+
+/// Off track first, then at risk, on track, on hold; no status at all goes last.
+fn urgency(p: &Project) -> u8 {
+    match p
+        .current_status_update
+        .as_ref()
+        .map(|u| u.status_type.as_str())
+    {
+        Some("off_track") => 0,
+        Some("at_risk") => 1,
+        Some("on_track") => 2,
+        Some("on_hold") => 3,
+        Some(_) => 4,
+        None => 5,
+    }
+}
+
+/// Open, unarchived projects I own, most urgent first, then soonest due, then by name.
+pub fn my_projects(workspace: &str) -> Result<Vec<Project>, String> {
     let v = run(&[
         "projects",
         "search",
@@ -327,53 +383,34 @@ fn owned_projects(workspace: &str) -> Result<Vec<Initiative>, String> {
         "--limit",
         "100",
         "--opt-fields",
-        "name,archived,current_status_update.status_type,current_status_update.created_at",
+        PROJECT_FIELDS,
     ])?;
-    let mut projects: Vec<Initiative> = decode::<Vec<OwnedProject>>(v)?
+    let mut projects: Vec<Project> = decode::<Vec<Project>>(v)?
         .into_iter()
         .filter(|p| !p.archived)
-        .map(|p| p.project)
         .collect();
-    projects.sort_by_key(|p| display_name(&p.name).to_lowercase());
-    Ok(projects)
-}
-
-/// Projects I own and their open tasks, one paginated list per project so none is cut off.
-pub fn my_projects(workspace: &str) -> Result<(Vec<Initiative>, Vec<Task>), String> {
-    let projects = owned_projects(workspace)?;
-    let lists: Vec<Result<Vec<Task>, String>> = std::thread::scope(|s| {
+    projects.sort_by_key(|p| {
+        (
+            urgency(p),
+            p.due_on.is_none(),
+            p.due_on,
+            display_name(&p.name).to_lowercase(),
+        )
+    });
+    let counts: Vec<Option<TaskCounts>> = std::thread::scope(|s| {
         let handles: Vec<_> = projects
             .iter()
-            .map(|p| {
-                s.spawn(|| {
-                    run(&[
-                        "tasks",
-                        "list",
-                        "--project",
-                        &p.gid,
-                        "--completed-since",
-                        "now",
-                        "--opt-fields",
-                        TASK_FIELDS,
-                    ])
-                    .and_then(decode::<Vec<Task>>)
-                })
-            })
+            .map(|p| s.spawn(|| task_counts(&p.gid).ok()))
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Err("worker panicked".into())))
+            .map(|h| h.join().ok().flatten())
             .collect()
     });
-    let mut tasks = vec![];
-    for (p, list) in projects.iter().zip(lists) {
-        let mut list = list?;
-        for t in &mut list {
-            t.my_project = Some(display_name(&p.name).to_string());
-        }
-        tasks = merge(tasks, list);
+    for (p, c) in projects.iter_mut().zip(counts) {
+        p.counts = c;
     }
-    Ok((projects, tasks))
+    Ok(projects)
 }
 
 pub fn add_comment(gid: &str, text: &str) -> Result<(), String> {

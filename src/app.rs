@@ -55,11 +55,6 @@ impl Tab {
         }
     }
 
-    /// Tabs whose rows are grouped under a project header, so rows show the assignee.
-    pub fn groups_by_project(self) -> bool {
-        self.is_initiative() || self == Tab::Projects
-    }
-
     pub fn is_initiative(self) -> bool {
         matches!(
             self,
@@ -85,11 +80,15 @@ pub enum Row {
     Task(usize),
     Session(usize),
     Inbox(usize),
+    Project(usize),
 }
 
 impl Row {
     fn selectable(&self) -> bool {
-        matches!(self, Row::Task(_) | Row::Session(_) | Row::Inbox(_))
+        matches!(
+            self,
+            Row::Task(_) | Row::Session(_) | Row::Inbox(_) | Row::Project(_)
+        )
     }
 }
 
@@ -97,7 +96,7 @@ pub struct Loaded {
     workspace: String,
     tasks: Vec<Task>,
     initiatives: Vec<asana::Initiative>,
-    projects: Vec<asana::Initiative>,
+    projects: Vec<asana::Project>,
 }
 
 pub enum Msg {
@@ -134,8 +133,8 @@ pub struct App {
     pub tasks: Vec<Task>,
     pub sessions: Vec<Session>,
     pub initiatives: Vec<asana::Initiative>,
-    /// Projects I own, by name, shown in the Projects tab even when they have no open tasks.
-    pub projects: Vec<asana::Initiative>,
+    /// Projects I own; the Projects tab gives an overview of each, not their tasks.
+    pub projects: Vec<asana::Project>,
     pub inbox: Vec<asana::InboxItem>,
     pub status: String,
     pub error: Option<String>,
@@ -228,17 +227,20 @@ impl App {
                         (mine, join(initiative), join(projects), join(inbox))
                     });
                     let _ = tx.send(Msg::Inbox(inbox));
-                    let or_empty = |label: &str, r: Result<_, String>| {
-                        r.unwrap_or_else(|e| {
-                            let _ = tx.send(Msg::Status(format!("{label}: {e}")));
-                            (vec![], vec![])
-                        })
+                    let or_empty = |label: &str, e: String| {
+                        let _ = tx.send(Msg::Status(format!("{label}: {e}")));
                     };
-                    let (initiatives, initiative_tasks) = or_empty("initiatives", initiative);
-                    let (projects, project_tasks) = or_empty("projects", projects);
+                    let (initiatives, initiative_tasks) = initiative.unwrap_or_else(|e| {
+                        or_empty("initiatives", e);
+                        (vec![], vec![])
+                    });
+                    let projects = projects.unwrap_or_else(|e| {
+                        or_empty("projects", e);
+                        vec![]
+                    });
                     mine.map(|m| Loaded {
                         workspace: ws,
-                        tasks: asana::merge(asana::merge(m, initiative_tasks), project_tasks),
+                        tasks: asana::merge(m, initiative_tasks),
                         initiatives,
                         projects,
                     })
@@ -363,23 +365,8 @@ impl App {
         rows
     }
 
-    /// Every project I own, empty ones included, with its open tasks soonest due first.
     fn project_rows(&self) -> Vec<Row> {
-        let mut rows = vec![];
-        for p in &self.projects {
-            let name = asana::display_name(&p.name);
-            let mut idx: Vec<usize> = (0..self.tasks.len())
-                .filter(|&i| {
-                    let t = &self.tasks[i];
-                    !t.completed && t.my_project.as_deref() == Some(name)
-                })
-                .collect();
-            idx.sort_by_key(|&i| (self.tasks[i].due_on.is_none(), self.tasks[i].due_on));
-            rows.push(Row::Header(name.to_string(), idx.len()));
-            rows.extend(idx.into_iter().map(Row::Task));
-            rows.push(Row::Blank);
-        }
-        rows
+        (0..self.projects.len()).map(Row::Project).collect()
     }
 
     /// Open items on an initiative tab, for the header badge.
@@ -451,6 +438,18 @@ impl App {
         }
     }
 
+    pub fn selected_project(&self) -> Option<&asana::Project> {
+        match self.rows().get(self.selected_row()?)? {
+            Row::Project(i) => self.projects.get(*i),
+            _ => None,
+        }
+    }
+
+    /// Whether the highlighted row has anything to show in the details pane.
+    pub fn has_detail(&self) -> bool {
+        self.selected_task().is_some() || self.selected_project().is_some()
+    }
+
     fn selected_session(&self) -> Option<&Session> {
         let rows = self.rows();
         match rows.get(self.selected_row()?)? {
@@ -469,13 +468,13 @@ impl App {
     /// Tab: move j/k between the list and the detail pane while it's open.
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::List if self.detail_open && self.selected_task().is_some() => Focus::Detail,
+            Focus::List if self.detail_open && self.has_detail() => Focus::Detail,
             _ => Focus::List,
         };
     }
 
     pub fn detail_focused(&self) -> bool {
-        self.focus == Focus::Detail && self.detail_open && self.selected_task().is_some()
+        self.focus == Focus::Detail && self.detail_open && self.has_detail()
     }
 
     pub fn scroll_detail(&mut self, delta: i16) {
@@ -491,11 +490,17 @@ impl App {
     }
 
     /// Fetches details for the highlighted task once; called every tick while the pane is open.
+    /// Projects arrive with their overview, so they only reset the scroll.
     pub fn ensure_detail(&mut self) {
         if !self.detail_open {
             return;
         }
-        let Some(gid) = self.selected_task().map(|t| t.gid.clone()) else {
+        let project = self.selected_project().map(|p| p.gid.clone());
+        let Some(gid) = self
+            .selected_task()
+            .map(|t| t.gid.clone())
+            .or(project.clone())
+        else {
             return;
         };
         match &self.hovered {
@@ -505,6 +510,9 @@ impl App {
                 self.detail_scroll = 0;
                 return;
             }
+        }
+        if project.is_some() {
+            return;
         }
         let settled = self
             .hovered
@@ -546,13 +554,15 @@ impl App {
     }
 
     pub fn open_in_browser(&mut self) {
-        let Some(task) = self.selected_task() else {
+        let Some((url, name)) = self
+            .selected_task()
+            .map(|t| (&t.permalink_url, &t.name))
+            .or(self.selected_project().map(|p| (&p.permalink_url, &p.name)))
+        else {
             return;
         };
-        let _ = std::process::Command::new("open")
-            .arg(&task.permalink_url)
-            .spawn();
-        self.status = format!("opened {}", task.name);
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        self.status = format!("opened {name}");
     }
 
     /// m: mark the selected inbox item read.
