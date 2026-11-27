@@ -97,8 +97,12 @@ const STATUS_STALE_DAYS: i64 = 7;
 
 /// "● on track · 3d", amber when older than a week, "no status" when never set.
 fn project_status(app: &App, project: &str) -> Option<Line<'static>> {
-    let initiative = app
-        .initiatives
+    let projects = if app.tab == Tab::Projects {
+        &app.projects
+    } else {
+        &app.initiatives
+    };
+    let initiative = projects
         .iter()
         .find(|i| crate::asana::display_name(&i.name) == project)?;
     let Some(update) = &initiative.current_status_update else {
@@ -124,7 +128,7 @@ fn project_status(app: &App, project: &str) -> Option<Line<'static>> {
 
 /// Initiative tabs group by project, so the column shows who owns the item instead.
 fn right_column<'a>(app: &App, task: &'a Task) -> &'a str {
-    if app.tab.is_initiative() {
+    if app.tab.groups_by_project() {
         task.assignee_name()
     } else {
         task.project()
@@ -226,7 +230,7 @@ fn hint_width(hints: &[(&str, &str)]) -> usize {
 const HELP: [(&str, &str); 17] = [
     ("j / k", "move"),
     ("g / G", "first / last"),
-    ("1–8, h / l", "switch view"),
+    ("1–9, h / l", "switch view"),
     ("enter", "focus or launch a Claude session"),
     ("space / p", "toggle details"),
     ("tab", "focus details (when open)"),
@@ -496,7 +500,7 @@ fn row_line<'a>(
     match row {
         Row::Blank => Line::from(""),
         Row::Header(title, n) => {
-            let status = if app.tab.is_initiative() {
+            let status = if app.tab.groups_by_project() {
                 project_status(app, title)
             } else {
                 None

@@ -21,10 +21,15 @@ pub enum Tab {
     Blockers,
     Questions,
     Inbox,
+    Projects,
+}
+
+fn join<T>(h: thread::ScopedJoinHandle<'_, Result<T, String>>) -> Result<T, String> {
+    h.join().unwrap_or_else(|_| Err("worker panicked".into()))
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [
+    pub const ALL: [Tab; 9] = [
         Tab::Today,
         Tab::MyTasks,
         Tab::Sessions,
@@ -33,6 +38,7 @@ impl Tab {
         Tab::Blockers,
         Tab::Questions,
         Tab::Inbox,
+        Tab::Projects,
     ];
 
     pub fn title(self) -> &'static str {
@@ -45,7 +51,13 @@ impl Tab {
             Tab::Blockers => "Blockers",
             Tab::Questions => "Questions",
             Tab::Inbox => "Inbox",
+            Tab::Projects => "Projects",
         }
+    }
+
+    /// Tabs whose rows are grouped under a project header, so rows show the assignee.
+    pub fn groups_by_project(self) -> bool {
+        self.is_initiative() || self == Tab::Projects
     }
 
     pub fn is_initiative(self) -> bool {
@@ -81,8 +93,15 @@ impl Row {
     }
 }
 
+pub struct Loaded {
+    workspace: String,
+    tasks: Vec<Task>,
+    initiatives: Vec<asana::Initiative>,
+    projects: Vec<asana::Initiative>,
+}
+
 pub enum Msg {
-    Tasks(Result<(String, Vec<Task>, Vec<asana::Initiative>), String>),
+    Tasks(Result<Loaded, String>),
     Reload,
     Sessions(Vec<Session>),
     Status(String),
@@ -115,6 +134,8 @@ pub struct App {
     pub tasks: Vec<Task>,
     pub sessions: Vec<Session>,
     pub initiatives: Vec<asana::Initiative>,
+    /// Projects I own, by name, shown in the Projects tab even when they have no open tasks.
+    pub projects: Vec<asana::Initiative>,
     pub inbox: Vec<asana::InboxItem>,
     pub status: String,
     pub error: Option<String>,
@@ -150,6 +171,7 @@ impl App {
             tasks: vec![],
             sessions: vec![],
             initiatives: vec![],
+            projects: vec![],
             inbox: vec![],
             status: String::new(),
             error: None,
@@ -198,27 +220,28 @@ impl App {
                 .unwrap_or_else(asana::workspace)
                 .and_then(|ws| {
                     let since = Utc::now() - Duration::days(1);
-                    let (mine, initiative, inbox) = thread::scope(|s| {
+                    let (mine, initiative, projects, inbox) = thread::scope(|s| {
                         let initiative = s.spawn(|| asana::initiative_tasks(&ws));
+                        let projects = s.spawn(|| asana::my_projects(&ws));
                         let inbox = s.spawn(|| asana::inbox(&ws));
                         let mine = asana::my_tasks(&ws, since);
-                        (
-                            mine,
-                            initiative
-                                .join()
-                                .unwrap_or_else(|_| Err("worker panicked".into())),
-                            inbox
-                                .join()
-                                .unwrap_or_else(|_| Err("worker panicked".into())),
-                        )
+                        (mine, join(initiative), join(projects), join(inbox))
                     });
                     let _ = tx.send(Msg::Inbox(inbox));
-                    let initiative = initiative.unwrap_or_else(|e| {
-                        let _ = tx.send(Msg::Status(format!("initiatives: {e}")));
-                        (vec![], vec![])
-                    });
-                    let (initiatives, tasks) = initiative;
-                    mine.map(|m| (ws, asana::merge(m, tasks), initiatives))
+                    let or_empty = |label: &str, r: Result<_, String>| {
+                        r.unwrap_or_else(|e| {
+                            let _ = tx.send(Msg::Status(format!("{label}: {e}")));
+                            (vec![], vec![])
+                        })
+                    };
+                    let (initiatives, initiative_tasks) = or_empty("initiatives", initiative);
+                    let (projects, project_tasks) = or_empty("projects", projects);
+                    mine.map(|m| Loaded {
+                        workspace: ws,
+                        tasks: asana::merge(asana::merge(m, initiative_tasks), project_tasks),
+                        initiatives,
+                        projects,
+                    })
                 });
             let _ = tx.send(Msg::Tasks(result));
         });
@@ -226,12 +249,13 @@ impl App {
 
     pub fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Tasks(Ok((ws, tasks, initiatives))) => {
-                self.initiatives = initiatives;
+            Msg::Tasks(Ok(loaded)) => {
+                self.initiatives = loaded.initiatives;
+                self.projects = loaded.projects;
                 self.loading = false;
                 self.error = None;
-                self.workspace = Some(ws);
-                self.tasks = tasks;
+                self.workspace = Some(loaded.workspace);
+                self.tasks = loaded.tasks;
             }
             Msg::Tasks(Err(e)) => {
                 self.loading = false;
@@ -271,6 +295,7 @@ impl App {
             Tab::MyTasks => self.section_rows(),
             Tab::Sessions => (0..self.sessions.len()).map(Row::Session).collect(),
             Tab::Inbox => (0..self.inbox.len()).map(Row::Inbox).collect(),
+            Tab::Projects => self.project_rows(),
             tab => self.initiative_rows(tab),
         }
     }
@@ -333,6 +358,25 @@ impl App {
                 group.len(),
             ));
             rows.extend(group.iter().copied().map(Row::Task));
+            rows.push(Row::Blank);
+        }
+        rows
+    }
+
+    /// Every project I own, empty ones included, with its open tasks soonest due first.
+    fn project_rows(&self) -> Vec<Row> {
+        let mut rows = vec![];
+        for p in &self.projects {
+            let name = asana::display_name(&p.name);
+            let mut idx: Vec<usize> = (0..self.tasks.len())
+                .filter(|&i| {
+                    let t = &self.tasks[i];
+                    !t.completed && t.my_project.as_deref() == Some(name)
+                })
+                .collect();
+            idx.sort_by_key(|&i| (self.tasks[i].due_on.is_none(), self.tasks[i].due_on));
+            rows.push(Row::Header(name.to_string(), idx.len()));
+            rows.extend(idx.into_iter().map(Row::Task));
             rows.push(Row::Blank);
         }
         rows

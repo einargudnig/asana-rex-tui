@@ -69,6 +69,7 @@ fn on_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('6') => app.set_tab(Tab::Blockers),
         KeyCode::Char('7') => app.set_tab(Tab::Questions),
         KeyCode::Char('8') => app.set_tab(Tab::Inbox),
+        KeyCode::Char('9') => app.set_tab(Tab::Projects),
         KeyCode::Char('m') => app.mark_selected_read(),
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => app.cycle_tab(true),
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => app.cycle_tab(false),

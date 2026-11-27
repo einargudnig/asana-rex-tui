@@ -43,6 +43,9 @@ pub struct Task {
     /// Name of the initiative project it lives in; only these show in the initiative tabs.
     #[serde(skip)]
     pub initiative: Option<String>,
+    /// Name of the project I own that it lives in; only these show in the Projects tab.
+    #[serde(skip)]
+    pub my_project: Option<String>,
 }
 
 impl Task {
@@ -196,15 +199,18 @@ pub fn my_tasks(workspace: &str, since: DateTime<Utc>) -> Result<Vec<Task>, Stri
     Ok(tasks)
 }
 
-/// My tasks first, then initiative tasks not already among them; shared ones get both flags.
-pub fn merge(mut mine: Vec<Task>, initiative: Vec<Task>) -> Vec<Task> {
-    for t in initiative {
-        match mine.iter_mut().find(|m| m.gid == t.gid) {
-            Some(m) => m.initiative = t.initiative,
-            None => mine.push(t),
+/// Appends `more` to `tasks`, folding duplicates into the existing task's flags.
+pub fn merge(mut tasks: Vec<Task>, more: Vec<Task>) -> Vec<Task> {
+    for t in more {
+        match tasks.iter_mut().find(|m| m.gid == t.gid) {
+            Some(m) => {
+                m.initiative = m.initiative.take().or(t.initiative);
+                m.my_project = m.my_project.take().or(t.my_project);
+            }
+            None => tasks.push(t),
         }
     }
-    mine
+    tasks
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +302,76 @@ pub fn initiative_tasks(workspace: &str) -> Result<(Vec<Initiative>, Vec<Task>),
             .iter()
             .find_map(|tp| projects.iter().find(|p| p.gid == tp.gid))
             .map(|p| display_name(&p.name).to_string());
+    }
+    Ok((projects, tasks))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OwnedProject {
+    #[serde(flatten)]
+    project: Initiative,
+    #[serde(default)]
+    archived: bool,
+}
+
+/// Open, unarchived projects I own, by name.
+fn owned_projects(workspace: &str) -> Result<Vec<Initiative>, String> {
+    let v = run(&[
+        "projects",
+        "search",
+        "--workspace",
+        workspace,
+        "--owner.any",
+        "me",
+        "--no-completed",
+        "--limit",
+        "100",
+        "--opt-fields",
+        "name,archived,current_status_update.status_type,current_status_update.created_at",
+    ])?;
+    let mut projects: Vec<Initiative> = decode::<Vec<OwnedProject>>(v)?
+        .into_iter()
+        .filter(|p| !p.archived)
+        .map(|p| p.project)
+        .collect();
+    projects.sort_by_key(|p| display_name(&p.name).to_lowercase());
+    Ok(projects)
+}
+
+/// Projects I own and their open tasks, one paginated list per project so none is cut off.
+pub fn my_projects(workspace: &str) -> Result<(Vec<Initiative>, Vec<Task>), String> {
+    let projects = owned_projects(workspace)?;
+    let lists: Vec<Result<Vec<Task>, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = projects
+            .iter()
+            .map(|p| {
+                s.spawn(|| {
+                    run(&[
+                        "tasks",
+                        "list",
+                        "--project",
+                        &p.gid,
+                        "--completed-since",
+                        "now",
+                        "--opt-fields",
+                        TASK_FIELDS,
+                    ])
+                    .and_then(decode::<Vec<Task>>)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("worker panicked".into())))
+            .collect()
+    });
+    let mut tasks = vec![];
+    for (p, list) in projects.iter().zip(lists) {
+        let mut list = list?;
+        for t in &mut list {
+            t.my_project = Some(display_name(&p.name).to_string());
+        }
+        tasks = merge(tasks, list);
     }
     Ok((projects, tasks))
 }
